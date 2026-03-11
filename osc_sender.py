@@ -721,9 +721,10 @@ class MidiPage(ctk.CTkFrame):
         ctk.CTkLabel(top, text="MIDI Device:").pack(side=tk.LEFT, padx=(0, 6))
         self._dev_var = ctk.StringVar(value="")
         self._dev_menu = ctk.CTkOptionMenu(top, variable=self._dev_var,
-                                           values=self._get_ports(), width=220,
+                                           values=["(loading...)"], width=220,
                                            command=self._on_device_select)
         self._dev_menu.pack(side=tk.LEFT)
+        self.after(100, self._refresh_ports)
         ctk.CTkButton(top, text="↺ Refresh", width=80,
                       command=self._refresh_ports).pack(side=tk.LEFT, padx=6)
         self._conn_label = ctk.CTkLabel(top, text="", text_color="#888",
