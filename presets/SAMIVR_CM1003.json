@@ -1,5 +1,6 @@
 {
   "num_active": 5,
+  "num_active_lfos": 12,
   "sources": [
     {
       "x": 0.0,
@@ -13,14 +14,14 @@
       "x": 0.0,
       "y": 0.0,
       "z": 0.0,
-      "gain_ambi": 0.5,
+      "gain_ambi": 0.5461538461538461,
       "gain_wfs": 0.5,
       "gain_lfe": 0.3
     },
     {
       "x": 0.0,
       "y": 0.0,
-      "z": 0.0,
+      "z": 0.24615384615384617,
       "gain_ambi": 0.4,
       "gain_wfs": 0.6,
       "gain_lfe": 0.2
@@ -204,12 +205,12 @@
       "target_par": "y"
     },
     {
-      "enabled": false,
-      "rate": 0.5,
-      "depth": 0.5,
+      "enabled": true,
+      "rate": 0.16353846153846155,
+      "depth": 0.17692307692307693,
       "phase": 0.0,
-      "target_src": 1,
-      "target_par": "x"
+      "target_src": 2,
+      "target_par": "z"
     },
     {
       "enabled": false,
@@ -259,5 +260,44 @@
       "target_src": 1,
       "target_par": "x"
     }
-  ]
+  ],
+  "chaos_sliders": [
+    {
+      "name": "Slider 1",
+      "value": 1.0,
+      "lo": 0.0,
+      "hi": 1.0,
+      "bindings": [
+        "lfo1_depth",
+        "lfo2_depth",
+        "lfo4_depth",
+        "lfo5_depth",
+        "lfo6_depth",
+        "lfo7_depth"
+      ]
+    },
+    {
+      "name": "Slider 2",
+      "value": 1.0,
+      "lo": 0.0,
+      "hi": 2.0,
+      "bindings": [
+        "lfo1_phase",
+        "lfo5_phase",
+        "lfo6_phase"
+      ]
+    },
+    {
+      "name": "Slider 3",
+      "value": 1.0,
+      "lo": 0.0,
+      "hi": 2.0,
+      "bindings": [
+        "lfo2_phase",
+        "lfo4_phase",
+        "lfo7_phase"
+      ]
+    }
+  ],
+  "midi_mappings": []
 }

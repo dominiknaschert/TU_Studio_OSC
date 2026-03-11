@@ -69,17 +69,121 @@ class LFO:
         self.target_par = "x"
         self._last_t    = None   # last time value() was called
         self._phase_acc = 0.0    # accumulated angle (rad), only speed of change varies
+        self.phase_jitter = 0.0  # chaos: random phase offset
+        self.rate_chaos = 0.0    # chaos: rate variation (0-1)
+        self.waveform_distort = 0.0  # chaos: non-linear distortion (0-1)
+        self._jitter_acc = 0.0   # accumulated jitter offset
 
-    def value(self, speed_mult: float = 1.0) -> float:
+    def value(self, speed_mult: float = 1.0,
+              rate_mult: float = 1.0,
+              depth_mult: float = 1.0,
+              phase_mult: float = 1.0) -> float:
         now = time.time()
         if self._last_t is None:
             self._last_t = now
         dt = now - self._last_t
         self._last_t = now
+        
+        # Add rate chaos
+        rate_mod = 1.0
+        if self.rate_chaos > 0:
+            # pseudo-random oscillation based on time
+            rate_mod = 1.0 + math.sin(now * (1 + self.rate_chaos * 5)) * self.rate_chaos * 0.5
+        
+        # Add phase jitter
+        if self.phase_jitter > 0:
+            self._jitter_acc += math.sin(now * 3.7) * self.phase_jitter * 0.1
+            self._jitter_acc = max(-math.pi, min(math.pi, self._jitter_acc))
+        
         # advance phase by (angle per second) * dt; changing speed_mult only changes future rate, not current position
-        self._phase_acc += 2 * math.pi * self.rate * speed_mult * dt
+        self._phase_acc += 2 * math.pi * self.rate * rate_mult * speed_mult * rate_mod * dt
         self._phase_acc %= 2 * math.pi  # keep in [0, 2*pi) for precision
-        return math.sin(self._phase_acc + self.phase) * self.depth
+        
+        effective_depth = self.depth * depth_mult
+        effective_phase = self.phase * phase_mult
+        
+        v = math.sin(self._phase_acc + effective_phase + self._jitter_acc) * effective_depth
+        
+        # Apply waveform distortion (non-linear shaping)
+        if self.waveform_distort > 0:
+            # soft tanh-like distortion mixed with original
+            distorted = math.tanh(v * (1 + self.waveform_distort * 3))
+            v = v * (1 - self.waveform_distort) + distorted * self.waveform_distort
+        
+        return v
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Chaos System
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ChaosSlider:
+    """A fixed multiplier slider that can control multiple parameters."""
+    def __init__(self, name: str, lo: float = 0.0, hi: float = 2.0):
+        self.name   = name
+        self.value  = 1.0
+        self.lo     = lo
+        self.hi     = hi
+        self.bindings: list[str] = []
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "value": self.value, "lo": self.lo, "hi": self.hi, "bindings": self.bindings}
+
+    @staticmethod
+    def from_dict(d: dict) -> "ChaosSlider":
+        cs = ChaosSlider(d["name"], d.get("lo", 0.0), d.get("hi", 1.0))
+        cs.value = d.get("value", 0.0)
+        cs.bindings = d.get("bindings", [])
+        return cs
+
+
+class ChaosSystem:
+    """Manages three fixed multiplier sliders."""
+    def __init__(self, engine: "Engine"):
+        self.engine = engine
+        self.sliders: list[ChaosSlider] = []
+        self._init_default_sliders()
+
+    def _init_default_sliders(self):
+        """Initialize exactly 3 sliders."""
+        if not self.sliders:
+            self.sliders.append(ChaosSlider("Slider 1"))
+            self.sliders.append(ChaosSlider("Slider 2"))
+            self.sliders.append(ChaosSlider("Slider 3"))
+
+    def set_sliders_from_data(self, slider_data: list[dict] | None):
+        defaults = [ChaosSlider("Slider 1"), ChaosSlider("Slider 2"), ChaosSlider("Slider 3")]
+        if not slider_data:
+            self.sliders = defaults
+            return
+
+        loaded = [ChaosSlider.from_dict(d) for d in slider_data[:3]]
+        while len(loaded) < 3:
+            loaded.append(defaults[len(loaded)])
+        for i, slider in enumerate(loaded):
+            if not slider.name:
+                slider.name = defaults[i].name
+        self.sliders = loaded
+
+    def get_target_multipliers(self) -> dict[str, float]:
+        multipliers: dict[str, float] = {}
+        for slider in self.sliders:
+            if not slider.bindings:
+                continue
+            for binding in slider.bindings:
+                multipliers[binding] = multipliers.get(binding, 1.0) * slider.value
+        return multipliers
+
+    def save(self, path: str):
+        with open(path, "w") as f:
+            json.dump([s.to_dict() for s in self.sliders], f, indent=2)
+
+    def load(self, path: str):
+        try:
+            with open(path) as f:
+                self.set_sliders_from_data(json.load(f))
+        except FileNotFoundError:
+            pass
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -92,10 +196,12 @@ class Engine:
         self.lfos:           list[LFO]        = [LFO() for _ in range(16)]
         self.client:         udp_client.SimpleUDPClient | None = None
         self.num_active      = 4
+        self.num_active_lfos = 4
         self.lfo_speed_mult  = 1.0   # global LFO speed multiplier
         self.running         = False
         # last rendered positions (with LFO applied) for the 3-D view
         self.rendered: list[tuple[float, float, float]] = [(0, 0, 0)] * MAX_SOURCES
+        self.chaos_system    = ChaosSystem(self)
 
     def connect(self, ip: str, port: int):
         self.client = udp_client.SimpleUDPClient(ip, port)
@@ -122,22 +228,36 @@ class Engine:
                 time.sleep(sleep_t)
 
     def _tick(self):
+        multipliers = self.chaos_system.get_target_multipliers()
+        speed_mult = self.lfo_speed_mult * multipliers.get("lfo_speed", 1.0)
+        
         offsets: dict[tuple[int, str], float] = {}
-        for lfo in self.lfos:
+        for i, lfo in enumerate(self.lfos[:self.num_active_lfos], start=1):
             if not lfo.enabled:
                 continue
             key = (lfo.target_src, lfo.target_par)
-            offsets[key] = offsets.get(key, 0.0) + lfo.value(self.lfo_speed_mult)
+            offsets[key] = offsets.get(key, 0.0) + lfo.value(
+                speed_mult,
+                rate_mult=multipliers.get(f"lfo{i}_rate", 1.0),
+                depth_mult=multipliers.get(f"lfo{i}_depth", 1.0),
+                phase_mult=multipliers.get(f"lfo{i}_phase", 1.0),
+            )
 
         rendered = list(self.rendered)
         for src in self.sources[:self.num_active]:
             si         = src.index
-            x          = clamp(src.x + offsets.get((si, "x"), 0.0))
-            y          = clamp(src.y + offsets.get((si, "y"), 0.0))
-            z          = clamp(src.z + offsets.get((si, "z"), 0.0))
-            gain_ambi  = clamp(src.gain_ambi + offsets.get((si, "gain_ambi"), 0.0), 0.0, 1.0)
-            gain_wfs   = clamp(src.gain_wfs  + offsets.get((si, "gain_wfs"),  0.0), 0.0, 1.0)
-            gain_lfe   = clamp(src.gain_lfe  + offsets.get((si, "gain_lfe"),  0.0), 0.0, 1.0)
+            x_mult     = multipliers.get(f"src{si}_x", 1.0)
+            y_mult     = multipliers.get(f"src{si}_y", 1.0)
+            z_mult     = multipliers.get(f"src{si}_z", 1.0)
+            ambi_mult  = multipliers.get(f"src{si}_gain_ambi", 1.0)
+            wfs_mult   = multipliers.get(f"src{si}_gain_wfs", 1.0)
+            lfe_mult   = multipliers.get(f"src{si}_gain_lfe", 1.0)
+            x          = clamp(src.x * x_mult + offsets.get((si, "x"), 0.0))
+            y          = clamp(src.y * y_mult + offsets.get((si, "y"), 0.0))
+            z          = clamp(src.z * z_mult + offsets.get((si, "z"), 0.0))
+            gain_ambi  = clamp(src.gain_ambi * ambi_mult + offsets.get((si, "gain_ambi"), 0.0), 0.0, 1.0)
+            gain_wfs   = clamp(src.gain_wfs  * wfs_mult  + offsets.get((si, "gain_wfs"),  0.0), 0.0, 1.0)
+            gain_lfe   = clamp(src.gain_lfe  * lfe_mult  + offsets.get((si, "gain_lfe"),  0.0), 0.0, 1.0)
             rendered[si - 1] = (x, y, z)
             if self.client:
                 try:
@@ -292,7 +412,7 @@ class LFOStrip(ctk.CTkFrame):
 class LFOPage(ctk.CTkScrollableFrame):
     def __init__(self, parent, engine: Engine, **kw):
         super().__init__(parent, orientation="horizontal", **kw)
-        for i, lfo in enumerate(engine.lfos):
+        for i, lfo in enumerate(engine.lfos[:engine.num_active_lfos]):
             LFOStrip(self, i, lfo, engine).pack(side=tk.LEFT, padx=6, pady=6, fill=tk.Y)
 
 
@@ -311,37 +431,69 @@ class View2DPage(ctk.CTkFrame):
 
     def _build(self):
         plt.style.use("dark_background")
-        self.fig, self.ax = plt.subplots(figsize=(5, 5), facecolor="#1c1c1c")
-        self.ax.set_facecolor("#1c1c1c")
-        self.ax.set_xlim(-1.1, 1.1)
-        self.ax.set_ylim(-1.1, 1.1)
-        self.ax.set_xlabel("X", color="#aaa")
-        self.ax.set_ylabel("Y", color="#aaa")
-        self.ax.tick_params(colors="#666", labelsize=8)
-        self.ax.axhline(0, color="#333", linewidth=0.8)
-        self.ax.axvline(0, color="#333", linewidth=0.8)
-        self.ax.set_aspect("equal")
-        self.ax.grid(True, color="#2a2a2a", linewidth=0.5)
+        self.fig, (self.ax_xy, self.ax_xz) = plt.subplots(1, 2, figsize=(10, 5), facecolor="#1c1c1c")
+        
+        # Configure XY plot
+        self.ax_xy.set_facecolor("#1c1c1c")
+        self.ax_xy.set_xlim(-1.1, 1.1)
+        self.ax_xy.set_ylim(-1.1, 1.1)
+        self.ax_xy.set_xlabel("X", color="#aaa")
+        self.ax_xy.set_ylabel("Y", color="#aaa")
+        self.ax_xy.tick_params(colors="#666", labelsize=8)
+        self.ax_xy.axhline(0, color="#333", linewidth=0.8)
+        self.ax_xy.axvline(0, color="#333", linewidth=0.8)
+        self.ax_xy.set_aspect("equal")
+        self.ax_xy.grid(True, color="#2a2a2a", linewidth=0.5)
 
-        # unit circle for reference
+        # unit circle for XY reference
         theta = [i * 2 * math.pi / 120 for i in range(121)]
-        self.ax.plot([math.cos(t) for t in theta],
-                     [math.sin(t) for t in theta],
-                     color="#333", linewidth=0.8, linestyle="--")
+        self.ax_xy.plot([math.cos(t) for t in theta],
+                        [math.sin(t) for t in theta],
+                        color="#333", linewidth=0.8, linestyle="--")
+
+        # Configure XZ plot
+        self.ax_xz.set_facecolor("#1c1c1c")
+        self.ax_xz.set_xlim(-1.1, 1.1)
+        self.ax_xz.set_ylim(-1.1, 1.1)
+        self.ax_xz.set_xlabel("X", color="#aaa")
+        self.ax_xz.set_ylabel("Z", color="#aaa")
+        self.ax_xz.tick_params(colors="#666", labelsize=8)
+        self.ax_xz.axhline(0, color="#333", linewidth=0.8)
+        self.ax_xz.axvline(0, color="#333", linewidth=0.8)
+        self.ax_xz.set_aspect("equal")
+        self.ax_xz.grid(True, color="#2a2a2a", linewidth=0.5)
+
+        # unit circle for XZ reference
+        self.ax_xz.plot([math.cos(t) for t in theta],
+                        [math.sin(t) for t in theta],
+                        color="#333", linewidth=0.8, linestyle="--")
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # pre-create scatter + labels (all hidden)
-        self._scatter = self.ax.scatter(
+        # pre-create scatter + labels for XY plot (all hidden)
+        self._scatter_xy = self.ax_xy.scatter(
             [0.0] * MAX_SOURCES, [0.0] * MAX_SOURCES,
             c=SOURCE_COLORS, s=[80] * MAX_SOURCES,
             edgecolors="white", linewidths=0.5, zorder=5, alpha=0.0,
         )
-        self._texts = [
-            self.ax.text(0, 0, f" S{i+1}",
-                         color=SOURCE_COLORS[i % len(SOURCE_COLORS)],
-                         fontsize=8, visible=False, zorder=6)
+        self._texts_xy = [
+            self.ax_xy.text(0, 0, f" S{i+1}",
+                            color=SOURCE_COLORS[i % len(SOURCE_COLORS)],
+                            fontsize=8, visible=False, zorder=6)
+            for i in range(MAX_SOURCES)
+        ]
+
+        # pre-create scatter + labels for XZ plot (all hidden)
+        self._scatter_xz = self.ax_xz.scatter(
+            [0.0] * MAX_SOURCES, [0.0] * MAX_SOURCES,
+            c=SOURCE_COLORS, s=[80] * MAX_SOURCES,
+            edgecolors="white", linewidths=0.5, zorder=5, alpha=0.0,
+        )
+        self._texts_xz = [
+            self.ax_xz.text(0, 0, f" S{i+1}",
+                            color=SOURCE_COLORS[i % len(SOURCE_COLORS)],
+                            fontsize=8, visible=False, zorder=6)
             for i in range(MAX_SOURCES)
         ]
 
@@ -358,17 +510,31 @@ class View2DPage(ctk.CTkFrame):
 
         xs = [rendered[i][0] if i < n else 0.0 for i in range(MAX_SOURCES)]
         ys = [rendered[i][1] if i < n else 0.0 for i in range(MAX_SOURCES)]
-
-        self._scatter.set_offsets(list(zip(xs, ys)))
-        self._scatter.set_alpha(1.0)
+        zs = [rendered[i][2] if i < n else 0.0 for i in range(MAX_SOURCES)]
 
         sizes = [max(40, self.engine.sources[i].gain_ambi * 200) if i < n else 1
                  for i in range(MAX_SOURCES)]
-        self._scatter.set_sizes(sizes)
 
-        for i, txt in enumerate(self._texts):
+        # Update XY plot
+        self._scatter_xy.set_offsets(list(zip(xs, ys)))
+        self._scatter_xy.set_alpha(1.0)
+        self._scatter_xy.set_sizes(sizes)
+
+        for i, txt in enumerate(self._texts_xy):
             if i < n:
                 txt.set_position((xs[i] + 0.03, ys[i] + 0.03))
+                txt.set_visible(True)
+            else:
+                txt.set_visible(False)
+
+        # Update XZ plot
+        self._scatter_xz.set_offsets(list(zip(xs, zs)))
+        self._scatter_xz.set_alpha(1.0)
+        self._scatter_xz.set_sizes(sizes)
+
+        for i, txt in enumerate(self._texts_xz):
+            if i < n:
+                txt.set_position((xs[i] + 0.03, zs[i] + 0.03))
                 txt.set_visible(True)
             else:
                 txt.set_visible(False)
@@ -455,6 +621,13 @@ class MidiEngine:
     def _default_range(self, target: str) -> tuple[float, float]:
         if target == "lfo_speed":
             return 0.0, 4.0
+        if target.startswith("chaos_slider_"):
+            try:
+                idx = int(target.split("_")[2]) - 1
+                slider = self.engine.chaos_system.sliders[idx]
+                return slider.lo, slider.hi
+            except (ValueError, IndexError):
+                return 0.0, 2.0
         if target.startswith("lfo") and "_" in target:
             # lfo1_rate, lfo2_depth, lfo3_phase
             if target.endswith("_rate"):
@@ -477,6 +650,16 @@ class MidiEngine:
         eng = self.engine
         if target == "lfo_speed":
             eng.lfo_speed_mult = max(0.0, min(4.0, value))
+            return
+        # Chaos sliders: "chaos_slider_1", "chaos_slider_2", "chaos_slider_3"
+        if target.startswith("chaos_slider_"):
+            try:
+                idx = int(target.split("_")[2]) - 1
+                if 0 <= idx < len(eng.chaos_system.sliders):
+                    slider = eng.chaos_system.sliders[idx]
+                    slider.value = max(slider.lo, min(slider.hi, value))
+            except (ValueError, IndexError):
+                pass
             return
         # "lfo{i}_rate" / "lfo{i}_depth" / "lfo{i}_phase"
         if target.startswith("lfo") and "_" in target:
@@ -607,8 +790,9 @@ class MidiPage(ctk.CTkFrame):
     def _refresh_index_dropdown(self):
         eng = self.engine
         indices = [f"Source {i}" for i in range(1, eng.num_active + 1)]
-        indices += [f"LFO {i}" for i in range(1, len(eng.lfos) + 1)]
+        indices += [f"LFO {i}" for i in range(1, eng.num_active_lfos + 1)]
         indices.append("LFO Speed")
+        indices += [f"Chaos Slider {i}" for i in range(1, len(eng.chaos_system.sliders) + 1)]
         self._index_menu.configure(values=indices)
         cur = self._index_var.get()
         if cur not in indices:
@@ -621,7 +805,9 @@ class MidiPage(ctk.CTkFrame):
         if idx.startswith("Source "):
             param_labels = [p[0] for p in self._SOURCE_PARAMS]
         elif idx == "LFO Speed":
-            param_labels = ["Speed"]
+            param_labels = ["Mult"]
+        elif idx.startswith("Chaos Slider "):
+            param_labels = ["Mult"]
         else:
             param_labels = [p[0] for p in self._LFO_PARAMS]
         self._param_menu.configure(values=param_labels)
@@ -649,7 +835,16 @@ class MidiPage(ctk.CTkFrame):
             except (ValueError, IndexError):
                 pass
         elif idx == "LFO Speed":
-            self._target_var.set("lfo_speed")
+            if param_label == "Mult":
+                self._target_var.set("lfo_speed")
+            return
+        elif idx.startswith("Chaos Slider "):
+            try:
+                i = int(idx.split()[2])
+                if param_label == "Mult":
+                    self._target_var.set(f"chaos_slider_{i}")
+            except (ValueError, IndexError):
+                pass
             return
         elif idx.startswith("LFO "):
             try:
@@ -778,6 +973,199 @@ class MidiPage(ctk.CTkFrame):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Chaos page
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ChaosPage(ctk.CTkScrollableFrame):
+    _SOURCE_PARAMS = [("X", "x"), ("Y", "y"), ("Z", "z"), ("Ambi", "gain_ambi"), ("WFS", "gain_wfs"), ("LFE", "gain_lfe")]
+    _LFO_PARAMS = [("Rate", "rate"), ("Depth", "depth"), ("Phase", "phase")]
+
+    def __init__(self, parent, engine: Engine, **kw):
+        super().__init__(parent, orientation="vertical", **kw)
+        self.engine = engine
+        self._build()
+
+    def _build(self):
+        ctk.CTkLabel(self, text="Chaos Sliders",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color="#4a9eff").pack(anchor="w", padx=15, pady=(12, 6))
+        ctk.CTkLabel(self,
+                     text="Jeder Slider arbeitet als Multiplikator. Ohne zugewiesene Parameter ist er im Bypass.",
+                     font=ctk.CTkFont(size=10), text_color="#888").pack(anchor="w", padx=15, pady=(0, 12))
+
+        for idx, slider in enumerate(self.engine.chaos_system.sliders, start=1):
+            self._build_slider_block(idx, slider).pack(fill=tk.X, padx=12, pady=6)
+
+    def _index_values(self) -> list[str]:
+        values = [f"Source {i}" for i in range(1, self.engine.num_active + 1)]
+        values += [f"LFO {i}" for i in range(1, self.engine.num_active_lfos + 1)]
+        values.append("LFO Speed")
+        return values
+
+    def _parameter_values(self, index_value: str) -> list[str]:
+        if index_value.startswith("Source "):
+            return [label for label, _ in self._SOURCE_PARAMS]
+        if index_value == "LFO Speed":
+            return ["Mult"]
+        return [label for label, _ in self._LFO_PARAMS]
+
+    def _target_from_selection(self, index_value: str, param_label: str) -> str:
+        if index_value.startswith("Source "):
+            try:
+                src_idx = int(index_value.split()[1])
+            except (ValueError, IndexError):
+                return ""
+            for label, attr in self._SOURCE_PARAMS:
+                if label == param_label:
+                    return f"src{src_idx}_{attr}"
+            return ""
+        if index_value == "LFO Speed":
+            return "lfo_speed" if param_label == "Mult" else ""
+        if index_value.startswith("LFO "):
+            try:
+                lfo_idx = int(index_value.split()[1])
+            except (ValueError, IndexError):
+                return ""
+            for label, attr in self._LFO_PARAMS:
+                if label == param_label:
+                    return f"lfo{lfo_idx}_{attr}"
+        return ""
+
+    def _target_label(self, binding: str) -> str:
+        if binding == "lfo_speed":
+            return "LFO Speed · Mult"
+        if binding.startswith("src") and "_" in binding:
+            head, attr = binding.split("_", 1)
+            try:
+                src_idx = int(head[3:])
+            except ValueError:
+                return binding
+            for label, source_attr in self._SOURCE_PARAMS:
+                if source_attr == attr:
+                    return f"Source {src_idx} · {label}"
+        if binding.startswith("lfo") and "_" in binding:
+            head, attr = binding.split("_", 1)
+            try:
+                lfo_idx = int(head[3:])
+            except ValueError:
+                return binding
+            for label, lfo_attr in self._LFO_PARAMS:
+                if lfo_attr == attr:
+                    return f"LFO {lfo_idx} · {label}"
+        return binding
+
+    def _build_slider_block(self, slider_number: int, slider: ChaosSlider) -> ctk.CTkFrame:
+        block = ctk.CTkFrame(self, corner_radius=8)
+
+        ctk.CTkLabel(block, text=f"Slider {slider_number}", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=12, pady=(10, 4))
+
+        top = ctk.CTkFrame(block, fg_color="transparent")
+        top.pack(fill=tk.X, padx=12, pady=(0, 8))
+
+        ctk.CTkLabel(top, text="Min", font=ctk.CTkFont(size=10)).pack(side=tk.LEFT)
+        lo_var = ctk.StringVar(value=f"{slider.lo:.2f}")
+        lo_entry = ctk.CTkEntry(top, textvariable=lo_var, width=58, height=24)
+        lo_entry.pack(side=tk.LEFT, padx=(4, 8))
+
+        slider_var = ctk.DoubleVar(value=slider.value)
+        slider_widget = ctk.CTkSlider(top, from_=slider.lo, to=slider.hi, variable=slider_var, width=140)
+        slider_widget.pack(side=tk.LEFT, padx=(0, 8))
+
+        ctk.CTkLabel(top, text="Max", font=ctk.CTkFont(size=10)).pack(side=tk.LEFT)
+        hi_var = ctk.StringVar(value=f"{slider.hi:.2f}")
+        hi_entry = ctk.CTkEntry(top, textvariable=hi_var, width=58, height=24)
+        hi_entry.pack(side=tk.LEFT, padx=(4, 12))
+
+        value_lbl = ctk.CTkLabel(top, text=f"{slider.value:.2f}", width=46)
+        value_lbl.pack(side=tk.LEFT, padx=(0, 12))
+
+        def sync_slider_range():
+            try:
+                lo = float(lo_var.get())
+                hi = float(hi_var.get())
+            except ValueError:
+                return
+            if lo >= hi:
+                return
+            slider.lo = lo
+            slider.hi = hi
+            slider.value = max(lo, min(hi, slider.value))
+            slider_var.set(slider.value)
+            slider_widget.configure(from_=lo, to=hi)
+            value_lbl.configure(text=f"{slider.value:.2f}")
+
+        lo_entry.bind("<Return>", lambda _e: sync_slider_range())
+        lo_entry.bind("<FocusOut>", lambda _e: sync_slider_range())
+        hi_entry.bind("<Return>", lambda _e: sync_slider_range())
+        hi_entry.bind("<FocusOut>", lambda _e: sync_slider_range())
+
+        def on_slider_change(v):
+            slider.value = float(v)
+            value_lbl.configure(text=f"{slider.value:.2f}")
+
+        slider_widget.configure(command=on_slider_change)
+
+        index_values = self._index_values()
+        index_var = ctk.StringVar(value=index_values[0])
+        index_menu = ctk.CTkOptionMenu(top, values=index_values, variable=index_var, width=140, height=28)
+        index_menu.pack(side=tk.LEFT, padx=(0, 8))
+
+        param_values = self._parameter_values(index_var.get())
+        param_var = ctk.StringVar(value=param_values[0])
+        param_menu = ctk.CTkOptionMenu(top, values=param_values, variable=param_var, width=120, height=28)
+        param_menu.pack(side=tk.LEFT, padx=(0, 8))
+
+        def refresh_param_menu(_choice=None):
+            params = self._parameter_values(index_var.get())
+            param_menu.configure(values=params)
+            if param_var.get() not in params:
+                param_var.set(params[0])
+
+        index_menu.configure(command=refresh_param_menu)
+
+        table = ctk.CTkFrame(block, fg_color="#171717")
+        table.pack(fill=tk.X, padx=12, pady=(0, 12))
+
+        def rebuild_table():
+            for child in table.winfo_children():
+                child.destroy()
+            if not slider.bindings:
+                ctk.CTkLabel(table, text="Bypass: keine Parameter zugewiesen",
+                             text_color="#666", font=ctk.CTkFont(size=10)).pack(anchor="w", padx=10, pady=8)
+                return
+
+            row = None
+            for i, binding in enumerate(slider.bindings):
+                if i % 3 == 0:
+                    row = ctk.CTkFrame(table, fg_color="transparent")
+                    row.pack(fill=tk.X, padx=6, pady=(6 if i == 0 else 2, 0))
+
+                item = ctk.CTkFrame(row, fg_color="#232323", corner_radius=6)
+                item.pack(side=tk.LEFT, padx=(0, 6), pady=0)
+                ctk.CTkLabel(item, text=self._target_label(binding),
+                             font=ctk.CTkFont(size=10)).pack(side=tk.LEFT, padx=(8, 4), pady=4)
+                ctk.CTkButton(item, text="✕", width=22, height=20,
+                              fg_color="#5a1a1a", hover_color="#7a2a2a",
+                              command=lambda b=binding: self._remove_binding(slider, b, rebuild_table)
+                              ).pack(side=tk.LEFT, padx=(0, 6), pady=3)
+
+        def add_binding():
+            target = self._target_from_selection(index_var.get(), param_var.get())
+            if target and target not in slider.bindings:
+                slider.bindings.append(target)
+                rebuild_table()
+
+        ctk.CTkButton(top, text="Add", width=64, height=28, command=add_binding).pack(side=tk.LEFT)
+        rebuild_table()
+        return block
+
+    def _remove_binding(self, slider: ChaosSlider, binding: str, rebuild_callback):
+        if binding in slider.bindings:
+            slider.bindings.remove(binding)
+            rebuild_callback()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Preset manager
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -793,6 +1181,7 @@ class PresetManager:
         eng  = self.engine
         data = {
             "num_active": eng.num_active,
+            "num_active_lfos": eng.num_active_lfos,
             "sources": [
                 {"x": s.x, "y": s.y, "z": s.z,
                  "gain_ambi": s.gain_ambi, "gain_wfs": s.gain_wfs, "gain_lfe": s.gain_lfe}
@@ -803,6 +1192,7 @@ class PresetManager:
                  "phase": lfo.phase, "target_src": lfo.target_src, "target_par": lfo.target_par}
                 for lfo in eng.lfos
             ],
+            "chaos_sliders": [s.to_dict() for s in eng.chaos_system.sliders],
         }
         if midi_mappings is not None:
             data["midi_mappings"] = [m.to_dict() for m in midi_mappings]
@@ -926,6 +1316,16 @@ class App(ctk.CTk):
         ctk.CTkButton(bar, text="Apply", width=55,
                       command=self._apply_sources).pack(side=tk.LEFT, padx=4)
 
+        ctk.CTkLabel(bar, text="LFOs:").pack(side=tk.LEFT, padx=(14, 2))
+        self.lfo_count_var = ctk.StringVar(value=str(self.engine.num_active_lfos))
+        ctk.CTkOptionMenu(
+            bar,
+            variable=self.lfo_count_var,
+            values=[str(i) for i in range(1, len(self.engine.lfos) + 1)],
+            width=70,
+            command=self._on_lfo_count_change,
+        ).pack(side=tk.LEFT)
+
         # LFO Speed multiplier (target in real time; smoothing avoids discrete jumps)
         ctk.CTkLabel(bar, text="LFO Speed:").pack(side=tk.LEFT, padx=(20, 2))
         self._speed_label = ctk.CTkLabel(bar, text="1.00×", width=40)
@@ -954,18 +1354,21 @@ class App(ctk.CTk):
         self.tabs = ctk.CTkTabview(self)
         self.tabs.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
 
-        for name in ("Sources", "LFOs", "XY View", "MIDI"):
+        for name in ("Sources", "LFOs", "Chaos", "MIDI", "2D Plane"):
             self.tabs.add(name)
 
         self.sources_page = SourcesPage(self.tabs.tab("Sources"), self.engine)
         self.sources_page.pack(fill=tk.BOTH, expand=True)
 
-        LFOPage(self.tabs.tab("LFOs"), self.engine).pack(fill=tk.BOTH, expand=True)
+        self._rebuild_lfo_tab()
 
-        View2DPage(self.tabs.tab("XY View"), self.engine).pack(fill=tk.BOTH, expand=True)
+        self.chaos_page = ChaosPage(self.tabs.tab("Chaos"), self.engine)
+        self.chaos_page.pack(fill=tk.BOTH, expand=True)
 
         self.midi_page = MidiPage(self.tabs.tab("MIDI"), self.midi_engine, self.engine)
         self.midi_page.pack(fill=tk.BOTH, expand=True)
+
+        View2DPage(self.tabs.tab("2D Plane"), self.engine).pack(fill=tk.BOTH, expand=True)
 
     def _connect(self):
         try:
@@ -992,9 +1395,34 @@ class App(ctk.CTk):
         try:
             n = int(self.num_var.get())
             self.sources_page.set_num_sources(n)
+            self._rebuild_chaos_tab()
             self.midi_page._refresh_index_dropdown()
         except (ValueError, tk.TclError):
             pass
+
+    def _on_lfo_count_change(self, value: str):
+        try:
+            n = max(1, min(len(self.engine.lfos), int(value)))
+        except ValueError:
+            return
+        self.engine.num_active_lfos = n
+        self.lfo_count_var.set(str(n))
+        self._rebuild_lfo_tab()
+        self._rebuild_chaos_tab()
+        self.midi_page._refresh_index_dropdown()
+
+    def _rebuild_lfo_tab(self):
+        lfo_tab = self.tabs.tab("LFOs")
+        for child in lfo_tab.winfo_children():
+            child.destroy()
+        LFOPage(lfo_tab, self.engine).pack(fill=tk.BOTH, expand=True)
+
+    def _rebuild_chaos_tab(self):
+        chaos_tab = self.tabs.tab("Chaos")
+        for child in chaos_tab.winfo_children():
+            child.destroy()
+        self.chaos_page = ChaosPage(chaos_tab, self.engine)
+        self.chaos_page.pack(fill=tk.BOTH, expand=True)
 
     def _build_preset_bar(self):
         self.preset_bar = PresetBar(self, self.preset_mgr, self.midi_engine, on_load_cb=self._apply_preset)
@@ -1003,6 +1431,7 @@ class App(ctk.CTk):
     def _apply_preset(self, name: str):
         data = self.preset_mgr.load(name)
         n    = data.get("num_active", self.engine.num_active)
+        lfo_n = data.get("num_active_lfos", self.engine.num_active_lfos)
 
         for i, sd in enumerate(data.get("sources", [])):
             src           = self.engine.sources[i]
@@ -1022,14 +1451,19 @@ class App(ctk.CTk):
             lfo.target_src = ld.get("target_src",  lfo.target_src)
             lfo.target_par = ld.get("target_par",  lfo.target_par)
 
+        # Load chaos sliders and keep the fixed three sliders as fallback for older presets.
+        chaos_data = data.get("chaos_sliders")
+        self.engine.chaos_system.set_sliders_from_data(chaos_data)
+
         # Rebuild pages so widgets re-read the updated model
         self.num_var.set(str(n))
         self.sources_page.set_num_sources(n)
+        self.engine.num_active_lfos = max(1, min(len(self.engine.lfos), int(lfo_n)))
+        self.lfo_count_var.set(str(self.engine.num_active_lfos))
 
-        lfo_tab = self.tabs.tab("LFOs")
-        for child in lfo_tab.winfo_children():
-            child.destroy()
-        LFOPage(lfo_tab, self.engine).pack(fill=tk.BOTH, expand=True)
+        self._rebuild_lfo_tab()
+        self._rebuild_chaos_tab()
+
         self.midi_page._refresh_index_dropdown()
 
         # load MIDI mappings from preset so they work immediately if device is connected
