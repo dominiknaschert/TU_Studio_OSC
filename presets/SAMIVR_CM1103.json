@@ -264,7 +264,7 @@
   "chaos_sliders": [
     {
       "name": "Slider 1",
-      "value": 1.0,
+      "value": 0.0,
       "lo": 0.0,
       "hi": 1.0,
       "bindings": [
@@ -278,7 +278,7 @@
     },
     {
       "name": "Slider 2",
-      "value": 1.3700787401574803,
+      "value": 1.4488188976377954,
       "lo": 0.0,
       "hi": 2.0,
       "bindings": [
@@ -289,7 +289,7 @@
     },
     {
       "name": "Slider 3",
-      "value": 0.4566929133858268,
+      "value": 0.4094488188976378,
       "lo": 0.0,
       "hi": 2.0,
       "bindings": [
