@@ -67,11 +67,19 @@ class LFO:
         self.phase      = 0.0
         self.target_src = 1
         self.target_par = "x"
-        self._start     = time.time()
+        self._last_t    = None   # last time value() was called
+        self._phase_acc = 0.0    # accumulated angle (rad), only speed of change varies
 
     def value(self, speed_mult: float = 1.0) -> float:
-        t = time.time() - self._start
-        return math.sin(2 * math.pi * self.rate * speed_mult * t + self.phase) * self.depth
+        now = time.time()
+        if self._last_t is None:
+            self._last_t = now
+        dt = now - self._last_t
+        self._last_t = now
+        # advance phase by (angle per second) * dt; changing speed_mult only changes future rate, not current position
+        self._phase_acc += 2 * math.pi * self.rate * speed_mult * dt
+        self._phase_acc %= 2 * math.pi  # keep in [0, 2*pi) for precision
+        return math.sin(self._phase_acc + self.phase) * self.depth
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -91,6 +99,9 @@ class Engine:
 
     def connect(self, ip: str, port: int):
         self.client = udp_client.SimpleUDPClient(ip, port)
+
+    def disconnect(self):
+        self.client = None
 
     def start(self):
         if self.running:
@@ -207,9 +218,10 @@ class SourcesPage(ctk.CTkScrollableFrame):
 # ═════════════════════════════════════════════════════════════════════════════
 
 class LFOStrip(ctk.CTkFrame):
-    def __init__(self, parent, idx: int, lfo: LFO, **kw):
+    def __init__(self, parent, idx: int, lfo: LFO, engine: Engine, **kw):
         super().__init__(parent, corner_radius=8, **kw)
         self.lfo = lfo
+        self.engine = engine
         self.idx = idx
         self._build()
 
@@ -267,7 +279,7 @@ class LFOStrip(ctk.CTkFrame):
         lbl.pack()
 
     def _animate(self):
-        v     = self.lfo.value()
+        v     = self.lfo.value(self.engine.lfo_speed_mult)
         depth = max(self.lfo.depth, 0.001)
         norm  = (v / depth + 1) / 2
         x     = int(norm * 96) + 2
@@ -281,7 +293,7 @@ class LFOPage(ctk.CTkScrollableFrame):
     def __init__(self, parent, engine: Engine, **kw):
         super().__init__(parent, orientation="horizontal", **kw)
         for i, lfo in enumerate(engine.lfos):
-            LFOStrip(self, i, lfo).pack(side=tk.LEFT, padx=6, pady=6, fill=tk.Y)
+            LFOStrip(self, i, lfo, engine).pack(side=tk.LEFT, padx=6, pady=6, fill=tk.Y)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -443,6 +455,14 @@ class MidiEngine:
     def _default_range(self, target: str) -> tuple[float, float]:
         if target == "lfo_speed":
             return 0.0, 4.0
+        if target.startswith("lfo") and "_" in target:
+            # lfo1_rate, lfo2_depth, lfo3_phase
+            if target.endswith("_rate"):
+                return 0.01, 5.0
+            if target.endswith("_phase"):
+                return 0.0, 2.0 * math.pi
+            if target.endswith("_depth"):
+                return 0.0, 1.0
         if target.endswith(("_x", "_y", "_z")):
             return -1.0, 1.0
         return 0.0, 1.0
@@ -456,7 +476,22 @@ class MidiEngine:
     def _set_target(self, target: str, value: float):
         eng = self.engine
         if target == "lfo_speed":
-            eng.lfo_speed_mult = value
+            eng.lfo_speed_mult = max(0.0, min(4.0, value))
+            return
+        # "lfo{i}_rate" / "lfo{i}_depth" / "lfo{i}_phase"
+        if target.startswith("lfo") and "_" in target:
+            rest = target[3:].split("_", 1)  # e.g. "1_rate"
+            try:
+                idx = int(rest[0]) - 1
+                attr = rest[1]
+                if 0 <= idx < len(eng.lfos) and attr in ("rate", "depth", "phase"):
+                    lfo = eng.lfos[idx]
+                    if attr == "phase":
+                        setattr(lfo, attr, value % (2 * math.pi))
+                    else:
+                        setattr(lfo, attr, max(0.0, min(5.0 if attr == "rate" else 1.0, value)))
+            except (ValueError, IndexError):
+                pass
             return
         # "src{i}_{attr}"  e.g. src1_x, src3_gain_ambi
         if target.startswith("src"):
@@ -512,7 +547,7 @@ class MidiPage(ctk.CTkFrame):
                                         font=ctk.CTkFont(size=11))
         self._conn_label.pack(side=tk.LEFT, padx=8)
 
-        # ── learn section ─────────────────────────────────────────────────────
+        # ── learn section: Index (Source/LFO) + Parameter + Learn CC ───────────
         learn_frame = ctk.CTkFrame(self, corner_radius=8)
         learn_frame.pack(fill=tk.X, padx=12, pady=6)
 
@@ -522,22 +557,31 @@ class MidiPage(ctk.CTkFrame):
         row = ctk.CTkFrame(learn_frame, fg_color="transparent")
         row.pack(fill=tk.X, padx=10, pady=(0, 8))
 
-        ctk.CTkLabel(row, text="Target:").pack(side=tk.LEFT, padx=(0, 4))
-        # build target list: lfo_speed + all src params
-        targets = ["lfo_speed"]
-        for i in range(1, MAX_SOURCES + 1):
-            for attr in ["x", "y", "z", "gain_ambi", "gain_wfs", "gain_lfe"]:
-                targets.append(f"src{i}_{attr}")
-        self._target_var = ctk.StringVar(value="lfo_speed")
-        ctk.CTkOptionMenu(row, variable=self._target_var,
-                          values=targets, width=180).pack(side=tk.LEFT, padx=4)
+        ctk.CTkLabel(row, text="Index:").pack(side=tk.LEFT, padx=(0, 4))
+        self._index_var = ctk.StringVar(value="Source 1")
+        self._index_menu = ctk.CTkOptionMenu(
+            row, variable=self._index_var, width=120,
+            command=self._on_index_select)
+        self._index_menu.pack(side=tk.LEFT, padx=4)
+
+        ctk.CTkLabel(row, text="Parameter:").pack(side=tk.LEFT, padx=(12, 4))
+        self._param_var = ctk.StringVar(value="X")
+        self._param_menu = ctk.CTkOptionMenu(
+            row, variable=self._param_var, width=100,
+            command=self._on_param_select)
+        self._param_menu.pack(side=tk.LEFT, padx=4)
 
         self._learn_btn = ctk.CTkButton(row, text="Learn CC", width=90,
-                                        command=self._start_learn)
-        self._learn_btn.pack(side=tk.LEFT, padx=6)
+                                         command=self._start_learn)
+        self._learn_btn.pack(side=tk.LEFT, padx=(12, 4))
         self._learn_status = ctk.CTkLabel(row, text="", text_color="#888",
                                           font=ctk.CTkFont(size=11))
-        self._learn_status.pack(side=tk.LEFT, padx=6)
+        self._learn_status.pack(side=tk.LEFT, padx=4)
+
+        self._target_var = ctk.StringVar(value="")  # internal target id (src1_x, lfo2_rate, …)
+        self._refresh_index_dropdown()
+        self._update_param_dropdown()
+        self._sync_target_from_selection()
 
         # ── mapping table ─────────────────────────────────────────────────────
         ctk.CTkLabel(self, text="Active Mappings",
@@ -555,6 +599,68 @@ class MidiPage(ctk.CTkFrame):
                       command=self._clear_all).pack(side=tk.LEFT)
 
         self._refresh_table()
+
+    # Index = Source 1..N, LFO 1..16, LFO Speed. Parameter = depends on index.
+    _SOURCE_PARAMS = [("X", "x"), ("Y", "y"), ("Z", "z"), ("Ambi", "gain_ambi"), ("WFS", "gain_wfs"), ("LFE", "gain_lfe")]
+    _LFO_PARAMS = [("Rate", "rate"), ("Depth", "depth"), ("Phase", "phase")]
+
+    def _refresh_index_dropdown(self):
+        eng = self.engine
+        indices = [f"Source {i}" for i in range(1, eng.num_active + 1)]
+        indices += [f"LFO {i}" for i in range(1, len(eng.lfos) + 1)]
+        indices.append("LFO Speed")
+        self._index_menu.configure(values=indices)
+        cur = self._index_var.get()
+        if cur not in indices:
+            self._index_var.set(indices[0])
+        self._update_param_dropdown()
+        self._sync_target_from_selection()
+
+    def _update_param_dropdown(self):
+        idx = self._index_var.get()
+        if idx.startswith("Source "):
+            param_labels = [p[0] for p in self._SOURCE_PARAMS]
+        elif idx == "LFO Speed":
+            param_labels = ["Speed"]
+        else:
+            param_labels = [p[0] for p in self._LFO_PARAMS]
+        self._param_menu.configure(values=param_labels)
+        cur = self._param_var.get()
+        if cur not in param_labels:
+            self._param_var.set(param_labels[0])
+        self._sync_target_from_selection()
+
+    def _on_index_select(self, _value: str):
+        self._update_param_dropdown()
+
+    def _on_param_select(self, _value: str):
+        self._sync_target_from_selection()
+
+    def _sync_target_from_selection(self):
+        idx = self._index_var.get()
+        param_label = self._param_var.get()
+        if idx.startswith("Source "):
+            try:
+                i = int(idx.split()[1])
+                for lab, attr in self._SOURCE_PARAMS:
+                    if lab == param_label:
+                        self._target_var.set(f"src{i}_{attr}")
+                        return
+            except (ValueError, IndexError):
+                pass
+        elif idx == "LFO Speed":
+            self._target_var.set("lfo_speed")
+            return
+        elif idx.startswith("LFO "):
+            try:
+                i = int(idx.split()[1])
+                for lab, attr in self._LFO_PARAMS:
+                    if lab == param_label:
+                        self._target_var.set(f"lfo{i}_{attr}")
+                        return
+            except (ValueError, IndexError):
+                pass
+        self._target_var.set("")
 
     def _get_ports(self) -> list[str]:
         try:
@@ -580,6 +686,9 @@ class MidiPage(ctk.CTkFrame):
 
     def _start_learn(self):
         target = self._target_var.get()
+        if not target:
+            self._learn_status.configure(text="Select a target (Source or LFO) first.", text_color="#e67e22")
+            return
         self.midi.learning = target
         self._learn_btn.configure(text="Waiting…", fg_color="#e67e22")
         self._learn_status.configure(text="Move a CC on your controller…", text_color="#f39c12")
@@ -680,7 +789,7 @@ class PresetManager:
         self.engine = engine
         os.makedirs(PRESETS_DIR, exist_ok=True)
 
-    def save(self, name: str):
+    def save(self, name: str, midi_mappings: list | None = None):
         eng  = self.engine
         data = {
             "num_active": eng.num_active,
@@ -695,6 +804,8 @@ class PresetManager:
                 for lfo in eng.lfos
             ],
         }
+        if midi_mappings is not None:
+            data["midi_mappings"] = [m.to_dict() for m in midi_mappings]
         with open(os.path.join(PRESETS_DIR, f"{name}.json"), "w") as f:
             json.dump(data, f, indent=2)
 
@@ -710,10 +821,11 @@ class PresetManager:
 
 
 class PresetBar(ctk.CTkFrame):
-    def __init__(self, parent, preset_mgr: PresetManager, on_load_cb, **kw):
+    def __init__(self, parent, preset_mgr: PresetManager, midi_engine: "MidiEngine", on_load_cb, **kw):
         super().__init__(parent, height=28, corner_radius=0,
                          fg_color="#1a1a1a", **kw)
         self._mgr      = preset_mgr
+        self._midi     = midi_engine
         self._on_load  = on_load_cb
         self._name_var = ctk.StringVar(value="")
         self._sel_var  = ctk.StringVar(value="")
@@ -764,7 +876,7 @@ class PresetBar(ctk.CTkFrame):
             return
         safe = "".join(c for c in name if c.isalnum() or c in "_ -")
         try:
-            self._mgr.save(safe)
+            self._mgr.save(safe, midi_mappings=self._midi.mappings)
             self._status.configure(text=f"✓ Saved '{safe}'", text_color="#4caf50")
             self.refresh_dropdown()
             self._sel_var.set(safe)
@@ -790,7 +902,7 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("OSC Spatial Sender")
-        self.geometry("1100x680")
+        self.geometry("1250x650")
 
         self.engine     = Engine()
         self.preset_mgr = PresetManager(self.engine)
@@ -814,7 +926,7 @@ class App(ctk.CTk):
         ctk.CTkButton(bar, text="Apply", width=55,
                       command=self._apply_sources).pack(side=tk.LEFT, padx=4)
 
-        # LFO Speed multiplier
+        # LFO Speed multiplier (target in real time; smoothing avoids discrete jumps)
         ctk.CTkLabel(bar, text="LFO Speed:").pack(side=tk.LEFT, padx=(20, 2))
         self._speed_label = ctk.CTkLabel(bar, text="1.00×", width=40)
         self._speed_label.pack(side=tk.LEFT)
@@ -831,8 +943,9 @@ class App(ctk.CTk):
         ctk.CTkEntry(bar, textvariable=self.ip_var, width=200).pack(side=tk.LEFT)
         ctk.CTkLabel(bar, text="Port:").pack(side=tk.LEFT, padx=(8, 2))
         ctk.CTkEntry(bar, textvariable=self.port_var, width=55).pack(side=tk.LEFT)
-        ctk.CTkButton(bar, text="Connect", width=75,
-                      command=self._connect).pack(side=tk.LEFT, padx=8)
+        self._conn_btn = ctk.CTkButton(bar, text="Connect", width=85,
+                                        command=self._connect)
+        self._conn_btn.pack(side=tk.LEFT, padx=8)
 
         self.status = ctk.CTkLabel(bar, text="⚫ disconnected", text_color="gray")
         self.status.pack(side=tk.LEFT, padx=4)
@@ -851,7 +964,8 @@ class App(ctk.CTk):
 
         View2DPage(self.tabs.tab("XY View"), self.engine).pack(fill=tk.BOTH, expand=True)
 
-        MidiPage(self.tabs.tab("MIDI"), self.midi_engine, self.engine).pack(fill=tk.BOTH, expand=True)
+        self.midi_page = MidiPage(self.tabs.tab("MIDI"), self.midi_engine, self.engine)
+        self.midi_page.pack(fill=tk.BOTH, expand=True)
 
     def _connect(self):
         try:
@@ -860,22 +974,30 @@ class App(ctk.CTk):
             self.status.configure(
                 text=f"🟢 {self.ip_var.get()}:{self.port_var.get()}",
                 text_color="#4caf50")
+            self._conn_btn.configure(text="Disconnect", command=self._disconnect)
         except Exception as e:
             self.status.configure(text=f"🔴 {e}", text_color="#f44336")
 
+    def _disconnect(self):
+        self.engine.disconnect()
+        self.status.configure(text="⚫ disconnected", text_color="gray")
+        self._conn_btn.configure(text="Connect", command=self._connect)
+
     def _on_speed_change(self, v):
-        self.engine.lfo_speed_mult = float(v)
-        self._speed_label.configure(text=f"{float(v):.2f}×")
+        v = max(0.0, min(4.0, float(v)))
+        self.engine.lfo_speed_mult = v
+        self._speed_label.configure(text=f"{v:.2f}×")
 
     def _apply_sources(self):
         try:
             n = int(self.num_var.get())
             self.sources_page.set_num_sources(n)
+            self.midi_page._refresh_index_dropdown()
         except (ValueError, tk.TclError):
             pass
 
     def _build_preset_bar(self):
-        self.preset_bar = PresetBar(self, self.preset_mgr, on_load_cb=self._apply_preset)
+        self.preset_bar = PresetBar(self, self.preset_mgr, self.midi_engine, on_load_cb=self._apply_preset)
         self.preset_bar.pack(fill=tk.X, pady=(4, 0))
 
     def _apply_preset(self, name: str):
@@ -908,6 +1030,12 @@ class App(ctk.CTk):
         for child in lfo_tab.winfo_children():
             child.destroy()
         LFOPage(lfo_tab, self.engine).pack(fill=tk.BOTH, expand=True)
+        self.midi_page._refresh_index_dropdown()
+
+        # load MIDI mappings from preset so they work immediately if device is connected
+        midi_data = data.get("midi_mappings", [])
+        self.midi_engine.mappings = [MidiMapping.from_dict(d) for d in midi_data]
+        self.midi_page._refresh_table()
 
     def on_close(self):
         self.midi_engine.disconnect()
