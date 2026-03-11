@@ -1,1 +1,30 @@
-[]
+[
+  {
+    "channel": 1,
+    "cc": 29,
+    "target": "lfo_speed",
+    "lo": 0.0,
+    "hi": 1.0
+  },
+  {
+    "channel": 1,
+    "cc": 30,
+    "target": "chaos_slider_1",
+    "lo": 0.0,
+    "hi": 1.0
+  },
+  {
+    "channel": 1,
+    "cc": 31,
+    "target": "chaos_slider_2",
+    "lo": 0.0,
+    "hi": 2.0
+  },
+  {
+    "channel": 1,
+    "cc": 32,
+    "target": "chaos_slider_3",
+    "lo": 0.0,
+    "hi": 2.0
+  }
+]

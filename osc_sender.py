@@ -576,18 +576,21 @@ class MidiEngine:
         self.engine   = engine
         self.mappings: list[MidiMapping] = []
         self._port    = None
+        self._port_name: str | None = None
         self._thread: threading.Thread | None = None
         self._running = False
         self.learning: str | None = None      # target being learned
         self.last_cc:  tuple[int,int] | None = None   # (channel, cc) of last CC seen
+        self.last_values: dict[tuple[int,int], int] = {}  # (channel, cc) -> raw 0-127
         self._on_learn_cb = None              # called when learn completes
 
     # ── port management ───────────────────────────────────────────────────────
 
     def connect(self, port_name: str):
         self.disconnect()
-        self._port    = mido.open_input(port_name)
-        self._running = True
+        self._port      = mido.open_input(port_name)
+        self._port_name = port_name
+        self._running   = True
         self._thread  = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -605,6 +608,7 @@ class MidiEngine:
             for msg in self._port.iter_pending():
                 if msg.type == "control_change":
                     self.last_cc = (msg.channel, msg.control)
+                    self.last_values[(msg.channel, msg.control)] = msg.value
                     if self.learning:
                         # auto-add mapping with sensible defaults
                         target = self.learning
@@ -868,7 +872,11 @@ class MidiPage(ctk.CTkFrame):
     def _refresh_ports(self):
         ports = self._get_ports()
         self._dev_menu.configure(values=ports)
-        if ports:
+        prev = self.midi._port_name
+        if prev and prev in ports:
+            self._dev_var.set(prev)
+            self._on_device_select(prev)
+        elif ports:
             self._dev_var.set(ports[0])
 
     def _on_device_select(self, name: str):
@@ -911,16 +919,19 @@ class MidiPage(ctk.CTkFrame):
     def _refresh_table(self):
         for w in self._table_frame.winfo_children():
             w.destroy()
+        self._live_vars: dict[tuple[int,int], ctk.StringVar] = {}
 
         # header
         hdr = ctk.CTkFrame(self._table_frame, fg_color="#2a2a2a", corner_radius=4)
         hdr.pack(fill=tk.X, pady=(0, 2))
-        for text, w in [("Ch", 40), ("CC", 40), ("Target", 180), ("Lo", 55), ("Hi", 55), ("", 60)]:
+        for text, w in [("Ch", 40), ("CC", 40), ("Target", 180), ("Lo", 55), ("Hi", 55), ("Val", 45), ("", 60)]:
             ctk.CTkLabel(hdr, text=text, width=w,
                          font=ctk.CTkFont(size=11, weight="bold")).pack(side=tk.LEFT, padx=4)
 
         for i, m in enumerate(self.midi.mappings):
             self._mapping_row(i, m)
+
+        self._poll_live_values()
 
     def _mapping_row(self, idx: int, m: MidiMapping):
         row = ctk.CTkFrame(self._table_frame, fg_color="#1e1e1e", corner_radius=4)
@@ -956,6 +967,11 @@ class MidiPage(ctk.CTkFrame):
         hi_e.bind("<Return>", update_hi)
         hi_e.bind("<FocusOut>", update_hi)
 
+        live_var = ctk.StringVar(value="—")
+        self._live_vars[(m.channel, m.cc)] = live_var
+        ctk.CTkLabel(row, textvariable=live_var, width=45,
+                     font=ctk.CTkFont(size=11), text_color="#aaa").pack(side=tk.LEFT, padx=4)
+
         ctk.CTkButton(row, text="✕", width=30, height=22,
                       fg_color="#5a1a1a", hover_color="#7a2a2a",
                       command=lambda i=idx: self._delete_mapping(i)).pack(side=tk.LEFT, padx=4)
@@ -963,6 +979,14 @@ class MidiPage(ctk.CTkFrame):
     def _delete_mapping(self, idx: int):
         del self.midi.mappings[idx]
         self._refresh_table()
+
+    def _poll_live_values(self):
+        if not hasattr(self, "_live_vars"):
+            return
+        for key, var in self._live_vars.items():
+            raw = self.midi.last_values.get(key)
+            var.set(str(raw) if raw is not None else "—")
+        self.after(100, self._poll_live_values)
 
     def _save(self):
         self.midi.save_mappings(self.MIDI_MAP_FILE)
@@ -1467,9 +1491,12 @@ class App(ctk.CTk):
 
         self.midi_page._refresh_index_dropdown()
 
-        # load MIDI mappings from preset so they work immediately if device is connected
-        midi_data = data.get("midi_mappings", [])
-        self.midi_engine.mappings = [MidiMapping.from_dict(d) for d in midi_data]
+        # load MIDI mappings from preset; fall back to midi_mappings.json if preset has none
+        midi_data = data.get("midi_mappings") or []
+        if midi_data:
+            self.midi_engine.mappings = [MidiMapping.from_dict(d) for d in midi_data]
+        else:
+            self.midi_engine.load_mappings(self.midi_page.MIDI_MAP_FILE)
         self.midi_page._refresh_table()
 
     def on_close(self):

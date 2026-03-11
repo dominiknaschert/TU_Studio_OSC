@@ -278,7 +278,7 @@
     },
     {
       "name": "Slider 2",
-      "value": 1.0,
+      "value": 1.3700787401574803,
       "lo": 0.0,
       "hi": 2.0,
       "bindings": [
@@ -289,7 +289,7 @@
     },
     {
       "name": "Slider 3",
-      "value": 1.0,
+      "value": 0.4566929133858268,
       "lo": 0.0,
       "hi": 2.0,
       "bindings": [
@@ -299,5 +299,34 @@
       ]
     }
   ],
-  "midi_mappings": []
+  "midi_mappings": [
+    {
+      "channel": 1,
+      "cc": 29,
+      "target": "lfo_speed",
+      "lo": 0.0,
+      "hi": 1.0
+    },
+    {
+      "channel": 1,
+      "cc": 30,
+      "target": "chaos_slider_1",
+      "lo": 0.0,
+      "hi": 1.0
+    },
+    {
+      "channel": 1,
+      "cc": 31,
+      "target": "chaos_slider_2",
+      "lo": 0.0,
+      "hi": 2.0
+    },
+    {
+      "channel": 1,
+      "cc": 32,
+      "target": "chaos_slider_3",
+      "lo": 0.0,
+      "hi": 2.0
+    }
+  ]
 }
