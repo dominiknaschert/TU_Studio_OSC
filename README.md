@@ -2,7 +2,7 @@
 
 A simple GUI tool using a network of MIDI-mappable LFOs and assignable sliders to send spatial audio positions via OSC to the Seamless plugin suite.
 
-Built for the TU Berlin studio.
+Built for the TU Berlin WFS studio.
 
 ---
 
