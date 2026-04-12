@@ -2,7 +2,7 @@
 
 A simple GUI tool to send spatial audio positions via OSC to spatial audio plugins (e.g. [IEM Plugin Suite](https://plugins.iem.at/), [SPARTA](http://research.spa.aalto.fi/projects/sparta_vst/)).
 
-Built for the TU Berlin studio — but works with anything that speaks OSC.
+Built for the TU Berlin studio.
 
 ---
 
@@ -13,7 +13,6 @@ Built for the TU Berlin studio — but works with anything that speaks OSC.
 - **8 sine LFOs** — assign to any parameter of any source
 - **live XY view** — see all sources move in real time
 - **dynamic source count** (1–16)
-- dark mode, no crashes on macOS 🙏
 
 ---
 
