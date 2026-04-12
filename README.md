@@ -1,4 +1,4 @@
-# 🔊 OSC Spatial Sender
+# OSC Spatial Sender
 
 A simple GUI tool to send spatial audio positions via OSC to spatial audio plugins (e.g. [IEM Plugin Suite](https://plugins.iem.at/), [SPARTA](http://research.spa.aalto.fi/projects/sparta_vst/)).
 
