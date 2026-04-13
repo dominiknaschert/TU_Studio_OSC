@@ -60,4 +60,4 @@ default target: `riviera.ak.tu-berlin.de:4455`
 
 ## license
 
-MIT — do whatever you want with it.
+MIT 
