@@ -8,7 +8,7 @@ Built for the TU Berlin WFS studio.
 
 ## features
 
-- control X / Y / Z position + Ambi** and WFS gain independently per source
+- control X / Y / Z position + Ambi and WFS gain independently per source
 - send to Ambisonics (renderer 0) and WFS (renderer 1) simultaneously
 - 8 sine LFOs — assign to any parameter of any source
 - live XY view — see all sources move in real time
